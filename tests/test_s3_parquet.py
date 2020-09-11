@@ -1,7 +1,7 @@
 import itertools
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import boto3
 import numpy as np
@@ -323,3 +323,67 @@ def test_multi_index_recovery_nameless(path, use_threads):
     wr.s3.wait_objects_exist(paths=paths, use_threads=use_threads)
     df2 = wr.s3.read_parquet(f"{path}*.parquet", use_threads=use_threads)
     assert df.reset_index().equals(df2.reset_index())
+
+
+def test_to_parquet_dataset_sanitize(path):
+    df = pd.DataFrame({"C0": [0, 1], "camelCase": [2, 3], "c**--2": [4, 5], "Par": ["a", "b"]})
+
+    paths = wr.s3.to_parquet(df, path, dataset=True, partition_cols=["Par"], sanitize_columns=False)["paths"]
+    wr.s3.wait_objects_exist(paths)
+    df2 = wr.s3.read_parquet(path, dataset=True)
+    assert df.shape == df2.shape
+    assert list(df2.columns) == ["C0", "camelCase", "c**--2", "Par"]
+    assert df2.C0.sum() == 1
+    assert df2.camelCase.sum() == 5
+    assert df2["c**--2"].sum() == 9
+    assert df2.Par.to_list() == ["a", "b"]
+
+    paths = wr.s3.to_parquet(df, path, dataset=True, partition_cols=["par"], sanitize_columns=True, mode="overwrite")[
+        "paths"
+    ]
+    wr.s3.wait_objects_exist(paths)
+    df2 = wr.s3.read_parquet(path, dataset=True)
+    assert df.shape == df2.shape
+    assert list(df2.columns) == ["c0", "camel_case", "c_2", "par"]
+    assert df2.c0.sum() == 1
+    assert df2.camel_case.sum() == 5
+    assert df2.c_2.sum() == 9
+    assert df2.par.to_list() == ["a", "b"]
+
+
+@pytest.mark.parametrize("use_threads", [False, True])
+def test_timezone_file(path, use_threads):
+    file_path = f"{path}0.parquet"
+    df = pd.DataFrame({"c0": [datetime.utcnow(), datetime.utcnow()]})
+    df["c0"] = pd.DatetimeIndex(df.c0).tz_localize(tz="US/Eastern")
+    df.to_parquet(file_path)
+    wr.s3.wait_objects_exist(paths=[file_path], use_threads=use_threads)
+    df2 = wr.s3.read_parquet(path, use_threads=use_threads)
+    assert df.equals(df2)
+
+
+@pytest.mark.parametrize("use_threads", [True, False])
+def test_timezone_file_columns(path, use_threads):
+    file_path = f"{path}0.parquet"
+    df = pd.DataFrame({"c0": [datetime.utcnow(), datetime.utcnow()], "c1": [1.1, 2.2]})
+    df["c0"] = pd.DatetimeIndex(df.c0).tz_localize(tz="US/Eastern")
+    df.to_parquet(file_path)
+    wr.s3.wait_objects_exist(paths=[file_path], use_threads=use_threads)
+    df2 = wr.s3.read_parquet(path, columns=["c1"], use_threads=use_threads)
+    assert df[["c1"]].equals(df2)
+
+
+@pytest.mark.parametrize("use_threads", [True, False])
+def test_timezone_raw_values(path, use_threads):
+    df = pd.DataFrame({"c0": [1.1, 2.2], "par": ["a", "b"]})
+    df["c1"] = pd.to_datetime(datetime.now(timezone.utc))
+    df["c2"] = pd.to_datetime(datetime(2011, 11, 4, 0, 5, 23, tzinfo=timezone(timedelta(seconds=14400))))
+    df["c3"] = pd.to_datetime(datetime(2011, 11, 4, 0, 5, 23, tzinfo=timezone(-timedelta(seconds=14400))))
+    df["c4"] = pd.to_datetime(datetime(2011, 11, 4, 0, 5, 23, tzinfo=timezone(timedelta(hours=-8))))
+    paths = wr.s3.to_parquet(partition_cols=["par"], df=df, path=path, dataset=True, sanitize_columns=False)["paths"]
+    wr.s3.wait_objects_exist(paths, use_threads=use_threads)
+    df2 = wr.s3.read_parquet(path, dataset=True, use_threads=use_threads)
+    df3 = pd.concat([pd.read_parquet(p) for p in paths], ignore_index=True)
+    df2["par"] = df2["par"].astype("string")
+    df3["par"] = df3["par"].astype("string")
+    assert df2.equals(df3)

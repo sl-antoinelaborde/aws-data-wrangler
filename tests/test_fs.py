@@ -2,13 +2,46 @@ import logging
 
 import boto3
 import pytest
+import s3fs
 
 import awswrangler as wr
 from awswrangler.s3._fs import open_s3_object
 
 from ._utils import ensure_data_types, get_df_list
 
-logging.getLogger("awswrangler").setLevel(logging.DEBUG)
+logger = logging.getLogger("awswrangler")
+logger.setLevel(logging.DEBUG)
+
+
+@pytest.mark.parametrize("use_threads", [True, False])
+@pytest.mark.parametrize("block_size", list(range(3, 10)) + [-1])
+@pytest.mark.parametrize("length", list(range(1, 10)))
+@pytest.mark.parametrize(
+    "seq", [(9, 5, 4, 9, 2, 6), (9, 2, 6, 1, 5, 9), (1, 5, 9, 1, 3, 9), (1, 3, 9, 1, 2, 3), (1, 2, 3, 9, 5, 4)]
+)
+def test_read(path, use_threads, block_size, seq, length):
+    client_s3 = boto3.client("s3")
+    path = f"{path}0.txt"
+    bucket, key = wr._utils.parse_path(path)
+    text = "0123456789"
+    client_s3.put_object(Body=text, Bucket=bucket, Key=key)
+    fs = s3fs.S3FileSystem()
+    with fs.open(path, "rb") as f:
+        with open_s3_object(path, mode="rb", s3_block_size=block_size, use_threads=use_threads) as s3obj:
+            for i in seq:
+                s3obj.seek(i)
+                f.seek(i)
+                data = s3obj.read(length)
+                assert data[0:1] == text[i].encode("utf-8")
+                assert data == f.read(length)
+                logger.debug(s3obj._cache)
+                if block_size < 1:
+                    assert len(s3obj._cache) == s3obj._size
+                elif length > block_size:
+                    assert block_size <= len(s3obj._cache) <= length
+                else:
+                    assert len(s3obj._cache) == block_size
+    assert s3obj._cache == b""
 
 
 @pytest.mark.parametrize("use_threads", [True, False])
@@ -45,7 +78,7 @@ def test_read_full(path, mode, use_threads):
 
 @pytest.mark.parametrize("use_threads", [True, False])
 @pytest.mark.parametrize("mode", ["r", "rb"])
-@pytest.mark.parametrize("block_size", [100, 2])
+@pytest.mark.parametrize("block_size", [100, 3])
 def test_read_chunked(path, mode, block_size, use_threads):
     client_s3 = boto3.client("s3")
     path = f"{path}0.txt"
@@ -59,15 +92,14 @@ def test_read_chunked(path, mode, block_size, use_threads):
         else:
             for i in range(3):
                 assert s3obj.read(1) == text[i].encode("utf-8")
-        if "b" in mode:
-            assert len(s3obj._cache) <= block_size
+                assert len(s3obj._cache) <= block_size
     if "b" in mode:
         assert s3obj._cache == b""
 
 
 @pytest.mark.parametrize("use_threads", [True, False])
 @pytest.mark.parametrize("mode", ["r", "rb"])
-@pytest.mark.parametrize("block_size", [2, 3, 10, 23, 48, 65, 100])
+@pytest.mark.parametrize("block_size", [3, 10, 23, 48, 65, 100])
 def test_read_line(path, mode, block_size, use_threads):
     client_s3 = boto3.client("s3")
     path = f"{path}0.txt"
@@ -83,7 +115,6 @@ def test_read_line(path, mode, block_size, use_threads):
                 assert line == expected[i].encode("utf-8")
         s3obj.seek(0)
         lines = s3obj.readlines()
-        print(lines)
         if mode == "r":
             assert lines == expected
         else:
@@ -160,7 +191,7 @@ def test_pyarrow(path, glue_table, glue_database):
 
 
 @pytest.mark.parametrize("use_threads", [True, False])
-@pytest.mark.parametrize("block_size", [2, 3, 5, 8, 9, 15])
+@pytest.mark.parametrize("block_size", [3, 5, 8, 9, 15])
 @pytest.mark.parametrize("text", ["012345678", "0123456789"])
 def test_cache(path, use_threads, block_size, text):
     client_s3 = boto3.client("s3")
@@ -170,7 +201,6 @@ def test_cache(path, use_threads, block_size, text):
     with open_s3_object(path, mode="rb", s3_block_size=block_size, use_threads=use_threads) as s3obj:
         for i in range(len(text)):
             value = s3obj.read(1)
-            print(value)
             assert value == text[i].encode("utf-8")
             assert len(s3obj._cache) in (block_size, block_size - 1, len(text))
     assert s3obj._cache == b""
