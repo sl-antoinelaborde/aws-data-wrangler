@@ -20,7 +20,6 @@ from awswrangler.s3._read import (
     _get_path_root,
     _union,
 )
-from awswrangler.s3._read_concurrent import _read_concurrent
 
 _logger: logging.Logger = logging.getLogger(__name__)
 
@@ -78,7 +77,7 @@ def _read_text_file(
         path=path,
         mode=mode,
         use_threads=use_threads,
-        s3_block_size=134_217_728,  # 128 MB (128 * 2**20)
+        s3_block_size=-1,  # One shot download
         encoding=encoding,
         s3_additional_kwargs=s3_additional_kwargs,
         newline=newline,
@@ -137,8 +136,6 @@ def _read_text(
         ret = _read_text_chunked(paths=paths, chunksize=chunksize, **args)
     elif len(paths) == 1:
         ret = _read_text_file(path=paths[0], **args)
-    elif use_threads is True:
-        ret = _read_concurrent(func=_read_text_file, paths=paths, ignore_index=ignore_index, **args)
     else:
         ret = _union(dfs=[_read_text_file(path=p, **args) for p in paths], ignore_index=ignore_index)
     return ret
@@ -361,7 +358,7 @@ def read_fwf(
     Reading all fixed-width formatted (FWF) files under a prefix
 
     >>> import awswrangler as wr
-    >>> df = wr.s3.read_fwf(path='s3://bucket/prefix/', widths=[1, 3], names=['c0', 'c1])
+    >>> df = wr.s3.read_fwf(path='s3://bucket/prefix/', widths=[1, 3], names=['c0', 'c1'])
 
     Reading all fixed-width formatted (FWF) files from a list
 

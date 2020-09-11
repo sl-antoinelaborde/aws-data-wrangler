@@ -28,7 +28,6 @@ from awswrangler.s3._read import (
     _get_path_root,
     _union,
 )
-from awswrangler.s3._read_concurrent import _read_concurrent
 
 _logger: logging.Logger = logging.getLogger(__name__)
 
@@ -192,10 +191,12 @@ def _apply_index(df: pd.DataFrame, metadata: Dict[str, Any]) -> pd.DataFrame:
 
 def _apply_timezone(df: pd.DataFrame, metadata: Dict[str, Any]) -> pd.DataFrame:
     for c in metadata["columns"]:
-        if c["pandas_type"] == "datetimetz":
-            _logger.debug("applying timezone (%s) on column %s", c["metadata"]["timezone"], c["field_name"])
-            df[c["field_name"]] = df[c["field_name"]].dt.tz_localize(tz="UTC")
-            df[c["field_name"]] = df[c["field_name"]].dt.tz_convert(tz=c["metadata"]["timezone"])
+        if c["field_name"] in df.columns and c["pandas_type"] == "datetimetz":
+            timezone: datetime.tzinfo = pa.lib.string_to_tzinfo(c["metadata"]["timezone"])
+            _logger.debug("applying timezone (%s) on column %s", timezone, c["field_name"])
+            if hasattr(df[c["field_name"]].dtype, "tz") is False:
+                df[c["field_name"]] = df[c["field_name"]].dt.tz_localize(tz="UTC")
+            df[c["field_name"]] = df[c["field_name"]].dt.tz_convert(tz=timezone)
     return df
 
 
@@ -315,11 +316,12 @@ def _read_parquet_file(
     s3_additional_kwargs: Optional[Dict[str, str]],
     use_threads: bool,
 ) -> pa.Table:
+    s3_block_size: int = 20_971_520 if columns else -1  # One shot for a full read otherwise 20 MB (20 * 2**20)
     with open_s3_object(
         path=path,
         mode="rb",
         use_threads=use_threads,
-        s3_block_size=134_217_728,  # 128 MB (128 * 2**20)
+        s3_block_size=s3_block_size,
         s3_additional_kwargs=s3_additional_kwargs,
         boto3_session=boto3_session,
     ) as f:
@@ -349,30 +351,6 @@ def _count_row_groups(
         return n
 
 
-def _read_parquet_row_group(
-    row_group: int,
-    path: str,
-    columns: Optional[List[str]],
-    categories: Optional[List[str]],
-    boto3_primitives: _utils.Boto3PrimitivesType,
-    s3_additional_kwargs: Optional[Dict[str, str]],
-    use_threads: bool,
-) -> pa.Table:
-    boto3_session: boto3.Session = _utils.boto3_from_primitives(primitives=boto3_primitives)
-    with open_s3_object(
-        path=path,
-        mode="rb",
-        use_threads=use_threads,
-        s3_block_size=10_485_760,  # 10 MB (10 * 2**20)
-        s3_additional_kwargs=s3_additional_kwargs,
-        boto3_session=boto3_session,
-    ) as f:
-        pq_file: pyarrow.parquet.ParquetFile = pyarrow.parquet.ParquetFile(source=f, read_dictionary=categories)
-        num_row_groups: int = pq_file.num_row_groups
-        _logger.debug("Reading Row Group %s/%s [multi-threaded]", row_group + 1, num_row_groups)
-        return pq_file.read_row_group(i=row_group, columns=columns, use_threads=False, use_pandas_metadata=False)
-
-
 def _read_parquet(
     path: str,
     columns: Optional[List[str]],
@@ -384,41 +362,15 @@ def _read_parquet(
     s3_additional_kwargs: Optional[Dict[str, str]],
     use_threads: bool,
 ) -> pd.DataFrame:
-    if use_threads is False:
-        table: pa.Table = _read_parquet_file(
+    return _arrowtable2df(
+        table=_read_parquet_file(
             path=path,
             columns=columns,
             categories=categories,
             boto3_session=boto3_session,
             s3_additional_kwargs=s3_additional_kwargs,
             use_threads=use_threads,
-        )
-    else:
-        cpus: int = _utils.ensure_cpu_count(use_threads=use_threads)
-        num_row_groups: int = _count_row_groups(
-            path=path,
-            categories=categories,
-            boto3_session=boto3_session,
-            s3_additional_kwargs=s3_additional_kwargs,
-            use_threads=use_threads,
-        )
-        with concurrent.futures.ThreadPoolExecutor(max_workers=cpus) as executor:
-            tables: Tuple[pa.Table, ...] = tuple(
-                executor.map(
-                    _read_parquet_row_group,
-                    range(num_row_groups),
-                    itertools.repeat(path),
-                    itertools.repeat(columns),
-                    itertools.repeat(categories),
-                    itertools.repeat(_utils.boto3_to_primitives(boto3_session=boto3_session)),
-                    itertools.repeat(s3_additional_kwargs),
-                    itertools.repeat(use_threads),
-                )
-            )
-            table = pa.lib.concat_tables(tables, promote=False)
-    _logger.debug("Converting PyArrow Table to Pandas DataFrame...")
-    return _arrowtable2df(
-        table=table,
+        ),
         categories=categories,
         safe=safe,
         use_threads=use_threads,
@@ -604,9 +556,6 @@ def read_parquet(
             boto3_session=boto3_session,
             s3_additional_kwargs=s3_additional_kwargs,
         )
-    if use_threads is True:
-        args["use_threads"] = True
-        return _read_concurrent(func=_read_parquet, paths=paths, ignore_index=None, **args)
     return _union(dfs=[_read_parquet(path=p, **args) for p in paths], ignore_index=None)
 
 

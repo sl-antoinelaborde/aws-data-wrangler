@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from typing import Any, BinaryIO, Dict, Iterator, List, Optional, Set, Tuple, Union, cast
 
 import boto3
-from botocore.exceptions import ClientError, ReadTimeoutError
+from botocore.exceptions import ReadTimeoutError
 
 from awswrangler import _utils, exceptions
 from awswrangler._config import apply_configs
@@ -63,21 +63,16 @@ def _fetch_range(
     _logger.debug("Fetching: s3://%s/%s - Range: %s-%s", bucket, key, start, end)
     boto3_session: boto3.Session = _utils.boto3_from_primitives(primitives=boto3_primitives)
     client: boto3.client = _utils.client(service_name="s3", session=boto3_session)
-    try:
-        resp: Dict[str, Any] = _utils.try_it(
-            f=client.get_object,
-            ex=_S3_RETRYABLE_ERRORS,
-            base=0.5,
-            max_num_tries=6,
-            Bucket=bucket,
-            Key=key,
-            Range=f"bytes={start}-{end - 1}",
-            **boto3_kwargs,
-        )
-    except ClientError as ex:
-        if ex.response["Error"].get("Code", "Unknown") in ("416", "InvalidRange"):
-            return start, b""
-        raise ex
+    resp: Dict[str, Any] = _utils.try_it(
+        f=client.get_object,
+        ex=_S3_RETRYABLE_ERRORS,
+        base=0.5,
+        max_num_tries=6,
+        Bucket=bucket,
+        Key=key,
+        Range=f"bytes={start}-{end - 1}",
+        **boto3_kwargs,
+    )
     return start, cast(bytes, resp["Body"].read())
 
 
@@ -197,8 +192,15 @@ class _S3Object:  # pylint: disable=too-many-instance-attributes
         if mode not in {"rb", "wb", "r", "w"}:
             raise NotImplementedError("File mode must be {'rb', 'wb', 'r', 'w'}, not %s" % mode)
         self._mode: str = "rb" if mode is None else mode
-        if s3_block_size < 2:
-            raise exceptions.InvalidArgumentValue("s3_block_size MUST > 1")
+        self._one_shot_download: bool = False
+        if 0 < s3_block_size < 3:
+            raise exceptions.InvalidArgumentValue(
+                "s3_block_size MUST > 2 to define a valid size or "
+                "< 1 to avoid blocks and always execute one shot downloads."
+            )
+        if s3_block_size <= 0:
+            _logger.debug("s3_block_size of %d, enabling one_shot_download.", s3_block_size)
+            self._one_shot_download = True
         self._s3_block_size: int = s3_block_size
         self._s3_half_block_size: int = s3_block_size // 2
         self._s3_additional_kwargs: Dict[str, str] = {} if s3_additional_kwargs is None else s3_additional_kwargs
@@ -295,11 +297,19 @@ class _S3Object:  # pylint: disable=too-many-instance-attributes
             )
 
     def _fetch(self, start: int, end: int) -> None:
-        end = self._size if end > self._size else end
-        start = 0 if start < 0 else start
+        if end > self._size:
+            raise ValueError(f"Trying to fetch byte (at position {end - 1}) beyond file size ({self._size})")
+        if start < 0:
+            raise ValueError(f"Trying to fetch byte (at position {start}) beyond file range ({self._size})")
 
         if start >= self._start and end <= self._end:
             return None  # Does not require download
+
+        if self._one_shot_download:
+            self._start = 0
+            self._end = self._size
+            self._cache = self._fetch_range_proxy(self._start, self._end)
+            return None
 
         if end - start >= self._s3_block_size:  # Fetching length greater than cache length
             self._cache = self._fetch_range_proxy(start, end)
@@ -309,9 +319,10 @@ class _S3Object:  # pylint: disable=too-many-instance-attributes
 
         # Calculating block START and END positions
         _logger.debug("Downloading: %s (start) / %s (end)", start, end)
-        mid: int = int(math.ceil((start + end) / 2))
+        mid: int = int(math.ceil((start + (end - 1)) / 2))
         new_block_start: int = mid - self._s3_half_block_size
-        new_block_end: int = mid + self._s3_half_block_size
+        new_block_start = new_block_start + 1 if self._s3_block_size % 2 == 0 else new_block_start
+        new_block_end: int = mid + self._s3_half_block_size + 1
         _logger.debug("new_block_start: %s / new_block_end: %s / mid: %s", new_block_start, new_block_end, mid)
         if new_block_start < 0 and new_block_end > self._size:  # both ends overflowing
             new_block_start = 0
@@ -321,7 +332,7 @@ class _S3Object:  # pylint: disable=too-many-instance-attributes
             new_block_start = 0 if new_block_start < 0 else new_block_start
             new_block_end = self._size
         elif new_block_start < 0:  # left overflow
-            new_block_end = new_block_end + (0 - new_block_start)
+            new_block_end = new_block_end - new_block_start
             new_block_end = self._size if new_block_end > self._size else new_block_end
             new_block_start = 0
         _logger.debug(
@@ -344,7 +355,7 @@ class _S3Object:  # pylint: disable=too-many-instance-attributes
             self._cache = self._cache[prune_diff:] + self._fetch_range_proxy(self._end, new_block_end)
         elif new_block_start < self._start:
             prune_diff = new_block_end - self._end
-            self._cache = self._cache[:-prune_diff] + self._fetch_range_proxy(new_block_start, self._start)
+            self._cache = self._fetch_range_proxy(new_block_start, self._start) + self._cache[:prune_diff]
         else:
             raise RuntimeError("Wrangler's cache calculation error.")
         self._start = new_block_start
@@ -357,10 +368,10 @@ class _S3Object:  # pylint: disable=too-many-instance-attributes
         _logger.debug("Reading: %s bytes at %s", length, self._loc)
         if self.readable() is False:
             raise ValueError("File not in read mode.")
-        if length < 0:
-            length = self._size - self._loc
         if self.closed is True:
             raise ValueError("I/O operation on closed file.")
+        if length < 0 or self._loc + length > self._size:
+            length = self._size - self._loc
 
         self._fetch(self._loc, self._loc + length)
         out: bytes = self._cache[self._loc - self._start : self._loc - self._start + length]
@@ -369,7 +380,9 @@ class _S3Object:  # pylint: disable=too-many-instance-attributes
 
     def readline(self, length: int = -1) -> Union[bytes, str]:
         """Read until the next line terminator."""
-        self._fetch(self._loc, self._loc + self._s3_block_size)
+        end: int = self._loc + self._s3_block_size
+        end = self._size if end > self._size else end
+        self._fetch(self._loc, end)
         while True:
             found: int = self._cache[self._loc - self._start :].find(self._newline.encode(encoding=self._encoding))
 
@@ -378,9 +391,11 @@ class _S3Object:  # pylint: disable=too-many-instance-attributes
             if found >= 0:
                 return self.read(found + 1)
             if self._end >= self._size:
-                return self.read(length)
+                return self.read(-1)
 
-            self._fetch(self._loc, self._end + self._s3_half_block_size)
+            end = self._end + self._s3_half_block_size
+            end = self._size if end > self._size else end
+            self._fetch(self._loc, end)
 
     def readlines(self) -> List[Union[bytes, str]]:
         """Return all lines as list."""
@@ -523,7 +538,7 @@ def open_s3_object(
     mode: str,
     use_threads: bool = False,
     s3_additional_kwargs: Optional[Dict[str, str]] = None,
-    s3_block_size: int = 4_194_304,  # 4 MB (4 * 2**20)
+    s3_block_size: int = -1,  # One shot download
     boto3_session: Optional[boto3.Session] = None,
     newline: Optional[str] = "\n",
     encoding: Optional[str] = "utf-8",
